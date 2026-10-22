@@ -38,7 +38,7 @@ export interface BrowserShortcutMatchInput {
   shift: boolean;
 }
 
-export type BrowserReservedShortcut = "focus-url" | "reload" | "force-reload";
+export type BrowserReservedShortcut = "focus-url" | "find" | "reload" | "force-reload";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -201,6 +201,8 @@ export function classifyBrowserReservedShortcut(
   }
   const key = input.key.toLowerCase();
   if (!input.shift && key === "l") return "focus-url";
+  // Matches isFindShortcut in packages/app/src/pane-find/find-shortcut.ts.
+  if (!input.shift && key === "f") return "find";
   if (key !== "r") return null;
   return input.shift ? "force-reload" : "reload";
 }

@@ -11,6 +11,7 @@ describe("browser keyboard policy", () => {
     const macInputs = [
       { type: "keyDown", key: "t", meta: true, control: false, alt: false, shift: false },
       { type: "keyDown", key: "l", meta: true, control: false, alt: false, shift: false },
+      { type: "keyDown", key: "f", meta: true, control: false, alt: false, shift: false },
       { type: "keyDown", key: "r", meta: true, control: false, alt: false, shift: false },
       { type: "keyDown", key: "r", meta: true, control: false, alt: false, shift: true },
     ];
@@ -22,10 +23,10 @@ describe("browser keyboard policy", () => {
 
     expect(
       macInputs.map((input) => classifyBrowserReservedShortcut(input, { isMac: true })),
-    ).toEqual([null, "focus-url", "reload", "force-reload"]);
+    ).toEqual([null, "focus-url", "find", "reload", "force-reload"]);
     expect(
       nonMacInputs.map((input) => classifyBrowserReservedShortcut(input, { isMac: false })),
-    ).toEqual([null, "focus-url", "reload", "force-reload"]);
+    ).toEqual([null, "focus-url", "find", "reload", "force-reload"]);
   });
 
   test("rejects the wrong or ambiguous command modifier for reserved shortcuts", () => {
@@ -60,6 +61,11 @@ describe("browser keyboard policy", () => {
         { isMac: true },
       ),
     ).toBeNull();
+    expect(
+      classifyBrowserReservedShortcut({ ...input, key: "f", shift: true }, { isMac: false }),
+    ).toBeNull();
+    // Control+F moves the caret forward on macOS; the page keeps it.
+    expect(classifyBrowserReservedShortcut({ ...input, key: "f" }, { isMac: true })).toBeNull();
   });
 
   test("accepts only complete modifier prefixes from the host renderer", () => {

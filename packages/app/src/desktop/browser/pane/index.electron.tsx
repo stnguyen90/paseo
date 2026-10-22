@@ -5,8 +5,10 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type CSSProperties,
   type ReactNode,
+  type RefObject,
   createElement,
 } from "react";
 import { createPortal } from "react-dom";
@@ -51,7 +53,9 @@ import {
 import type { AttachmentMetadata, BrowserElementAttachment } from "@/attachments/types";
 import { persistAttachmentFromDataUrl } from "@/attachments/service";
 import { WORKSPACE_SECONDARY_HEADER_HEIGHT } from "@/constants/layout";
-import { getOverlayRoot } from "@/lib/overlay-root";
+import { getOverlayRoot, hasActiveWebOverlay } from "@/lib/overlay-root";
+import { PaneFind, findShortcutPlatform, isFindShortcut, type PaneFindHandle } from "@/pane-find";
+import { isImeComposingKeyboardEvent } from "@/utils/keyboard-ime";
 import {
   getDesktopHost,
   isElectronRuntime,
@@ -78,22 +82,24 @@ import {
   type BrowserElementSelection,
   type ElementSelectorOutcome,
 } from "./element-selector.electron";
+import { BrowserFindModel, type FindableWebview, type FoundInPageResult } from "./find-model";
 
-type ElectronWebview = HTMLElement & {
-  canGoBack?: () => boolean;
-  canGoForward?: () => boolean;
-  goBack?: () => void;
-  goForward?: () => void;
-  reload?: () => void;
-  stop?: () => void;
-  loadURL?: (url: string) => Promise<void>;
-  getURL?: () => string;
-  isLoading?: () => boolean;
-  executeJavaScript?: (code: string) => Promise<unknown>;
-  focus?: () => void;
-  addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
-  removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
-};
+type ElectronWebview = HTMLElement &
+  FindableWebview & {
+    canGoBack?: () => boolean;
+    canGoForward?: () => boolean;
+    goBack?: () => void;
+    goForward?: () => void;
+    reload?: () => void;
+    stop?: () => void;
+    loadURL?: (url: string) => Promise<void>;
+    getURL?: () => string;
+    isLoading?: () => boolean;
+    executeJavaScript?: (code: string) => Promise<unknown>;
+    focus?: () => void;
+    addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
+    removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
+  };
 
 interface BrowserElementAnnotation {
   comment: string;
@@ -426,7 +432,7 @@ function isDesktopBrowserShortcutEvent(payload: unknown): payload is DesktopBrow
     return false;
   }
   const event = payload as Partial<DesktopBrowserShortcutEvent>;
-  return event.action === "focus-url";
+  return event.action === "focus-url" || event.action === "find";
 }
 
 function ToolbarButton({
@@ -624,6 +630,8 @@ export function BrowserPane({
     selectorControllerRef.current = createElementSelectorController();
   }
   const selectorActive = selectorMode !== null;
+  const findModel = useMemo(() => new BrowserFindModel(() => webviewRef.current), []);
+  const findWidgetRef = useRef<PaneFindHandle | null>(null);
   const toast = useToast();
   const toastRef = useRef(toast);
   toastRef.current = toast;
@@ -838,12 +846,16 @@ export function BrowserPane({
     };
     const handleDomReady = () => {
       syncNavigationState();
+      findModel.reset();
       // The previous page's overlay is gone after a load; re-apply markers for
       // the freshly loaded document.
       const markers = annotationMarkersRef.current;
       if (markers.length > 0) {
         applyAnnotationMarkers(webview, markers);
       }
+    };
+    const handleFoundInPage = (event: Event) => {
+      findModel.handleResult((event as Event & { result: FoundInPageResult }).result);
     };
     const handleWebviewFocus = () => {
       onFocusPane?.();
@@ -865,6 +877,7 @@ export function BrowserPane({
     webview.addEventListener("page-favicon-updated", handleFaviconUpdated);
     webview.addEventListener("did-fail-load", handleLoadFailed);
     webview.addEventListener("dom-ready", handleDomReady);
+    webview.addEventListener("found-in-page", handleFoundInPage);
     webview.addEventListener("focus", handleWebviewFocus);
     webview.addEventListener("mousedown", handleWebviewFocus);
 
@@ -891,6 +904,7 @@ export function BrowserPane({
       webview.removeEventListener("page-favicon-updated", handleFaviconUpdated);
       webview.removeEventListener("did-fail-load", handleLoadFailed);
       webview.removeEventListener("dom-ready", handleDomReady);
+      webview.removeEventListener("found-in-page", handleFoundInPage);
       webview.removeEventListener("focus", handleWebviewFocus);
       webview.removeEventListener("mousedown", handleWebviewFocus);
       const browserStillExists = Boolean(
@@ -902,6 +916,7 @@ export function BrowserPane({
         removeResidentBrowserWebview(browserIdRef.current);
       }
       selectorControllerRef.current?.stopForWebview(webview);
+      findModel.close();
       if (webviewRef.current === webview) {
         webviewRef.current = null;
       }
@@ -994,12 +1009,37 @@ export function BrowserPane({
     webviewRef.current?.reload?.();
   }, [browser?.isLoading, browserId, updateBrowser]);
 
+  const openFind = useCallback(() => {
+    findModel.open();
+    findWidgetRef.current?.focus();
+  }, [findModel]);
+
+  const closeFind = useCallback(() => {
+    findModel.close();
+    webviewRef.current?.focus?.();
+  }, [findModel]);
+
+  useEffect(() => {
+    if (!isPresented) findModel.close();
+  }, [findModel, isPresented]);
+
   useEffect(() => {
     if (!isElectronRuntime() || !isInteractive) {
       return;
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        isFindShortcut(event, findShortcutPlatform()) &&
+        !hasActiveWebOverlay() &&
+        !isImeComposingKeyboardEvent(event)
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        openFind();
+        return;
+      }
       if (isBrowserShortcutKey(event, "l")) {
         event.preventDefault();
         event.stopPropagation();
@@ -1019,7 +1059,7 @@ export function BrowserPane({
     return () => {
       window.removeEventListener("keydown", handleKeyDown, true);
     };
-  }, [focusUrlBar, handleRefresh, isInteractive]);
+  }, [focusUrlBar, handleRefresh, isInteractive, openFind]);
 
   useEffect(() => {
     if (!isElectronRuntime()) {
@@ -1033,7 +1073,11 @@ export function BrowserPane({
         if (payload.browserId !== browserIdRef.current) {
           return;
         }
-        focusUrlBar();
+        if (payload.action === "find") {
+          openFind();
+        } else {
+          focusUrlBar();
+        }
         return;
       }
       if (!isInteractive) {
@@ -1048,7 +1092,7 @@ export function BrowserPane({
     return () => {
       void unsubscribe?.then((dispose) => dispose());
     };
-  }, [focusUrlBar, isInteractive]);
+  }, [focusUrlBar, isInteractive, openFind]);
 
   const handleNavigateDraftUrl = useCallback(() => {
     navigate(draftUrl);
@@ -1552,6 +1596,12 @@ export function BrowserPane({
             onCancel={cancelAnnotation}
           />
         ) : null}
+        <BrowserFind
+          anchorRef={webviewClipRef}
+          model={findModel}
+          widgetRef={findWidgetRef}
+          onClose={closeFind}
+        />
       </View>
     </View>
   );
@@ -1643,6 +1693,50 @@ function BrowserElementAnnotationCard({
           </Button>
         </View>
       </View>
+    </View>,
+    getOverlayRoot(),
+  );
+}
+
+function BrowserFind({
+  anchorRef,
+  model,
+  widgetRef,
+  onClose,
+}: {
+  anchorRef: RefObject<HTMLElement | null>;
+  model: BrowserFindModel;
+  widgetRef: RefObject<PaneFindHandle | null>;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const state = useSyncExternalStore(model.subscribe, model.getSnapshot, model.getSnapshot);
+  // Read the ref here: this re-renders on find state alone, after the clip mounts.
+  const bounds = useElementBounds(state.open ? anchorRef.current : null);
+  if (!state.open || !bounds) {
+    return null;
+  }
+  let status = "";
+  if (state.query && state.current !== null) {
+    if (state.total === 0) status = t("paneFind.noMatches");
+    else if (state.current > 0)
+      status = t("paneFind.position", { current: state.current, total: state.total });
+    else status = t("paneFind.total", { total: state.total });
+  }
+  // The webview paints on its own plane under the overlay root, so the widget
+  // portals there and tracks the page area, like the annotation card.
+  return createPortal(
+    <View style={[styles.findOverlay, bounds]} pointerEvents="box-none">
+      <PaneFind
+        ref={widgetRef}
+        query={state.query}
+        status={status}
+        canNavigate={state.total > 0}
+        onQueryChange={model.setQuery}
+        onNext={model.next}
+        onPrevious={model.previous}
+        onClose={onClose}
+      />
     </View>,
     getOverlayRoot(),
   );
@@ -1776,6 +1870,12 @@ const styles = StyleSheet.create((theme) => ({
   toolbarTooltipText: {
     fontSize: theme.fontSize.sm,
     color: theme.colors.popoverForeground,
+  },
+  findOverlay: {
+    position: "absolute",
+    zIndex: 1,
+    padding: theme.spacing[2],
+    alignItems: "flex-end",
   },
   annotationOverlay: {
     position: "absolute",

@@ -308,6 +308,24 @@ describe("BrowserKeyboard", () => {
     ]);
   });
 
+  test("routes find to the browser pane that owns the guest", () => {
+    const { attach } = createBrowserKeyboard();
+    const guest = new FakeBrowserContents(85);
+    const host = new FakeBrowserContents(86);
+    attach({ browserId: "browser-a", contents: guest, hostContents: host });
+    const command = process.platform === "darwin" ? { meta: true } : { control: true };
+
+    const wasPrevented = guest.input(electronInput({ ...command, code: "KeyF", key: "f" }));
+
+    expect(wasPrevented).toBe(true);
+    expect(host.sent).toEqual([
+      {
+        channel: "paseo:event:browser-shortcut",
+        payload: { action: "find", browserId: "browser-a" },
+      },
+    ]);
+  });
+
   test("keeps policy-owned shortcuts out of the application menu without preempting the page", () => {
     const { attach, keyboard } = createBrowserKeyboard();
     const guest = new FakeBrowserContents(91);

@@ -131,6 +131,7 @@ export interface DesktopAgentNavigationBridge {
 
 export type DesktopBrowserShortcutEvent =
   | { browserId?: string; action: "focus-url" }
+  | { browserId: string; action: "find" }
   | { browserId: string; action: "new-tab" };
 
 export interface DesktopBrowserNewTabRequestEvent {
