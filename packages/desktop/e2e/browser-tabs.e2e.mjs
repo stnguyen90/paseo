@@ -455,7 +455,7 @@ function recordViewportMismatch(failures, label, actual, expected) {
   );
 }
 
-async function setWindowHidden(inspectorPort, hidden) {
+async function evaluateInMain(inspectorPort, expression) {
   const [target] = await (await fetch(`http://127.0.0.1:${inspectorPort}/json/list`)).json();
   const socket = new WebSocket(target.webSocketDebuggerUrl);
   try {
@@ -471,13 +471,7 @@ async function setWindowHidden(inspectorPort, hidden) {
         "open",
         () =>
           socket.send(
-            JSON.stringify({
-              id: 1,
-              method: "Runtime.evaluate",
-              params: {
-                expression: `(() => { const win = process.mainModule.require('electron').BrowserWindow.getAllWindows().find(win => win.webContents.getURL().includes('localhost:')); win.${hidden ? "hide" : "show"}(); if (win.isVisible() !== ${!hidden}) throw new Error('Window visibility did not change'); })()`,
-              },
-            }),
+            JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression } }),
           ),
         { once: true },
       );
@@ -485,6 +479,102 @@ async function setWindowHidden(inspectorPort, hidden) {
   } finally {
     socket.close();
   }
+}
+
+async function setWindowHidden(inspectorPort, hidden) {
+  await evaluateInMain(
+    inspectorPort,
+    `(() => { const win = process.mainModule.require('electron').BrowserWindow.getAllWindows().find(win => win.webContents.getURL().includes('localhost:')); win.${hidden ? "hide" : "show"}(); if (win.isVisible() !== ${!hidden}) throw new Error('Window visibility did not change'); })()`,
+  );
+}
+
+async function readFindStatus(page) {
+  const status = page.locator('[aria-label="Find matches"]');
+  return (await status.count()) > 0 ? ((await status.textContent()) ?? "").trim() : null;
+}
+
+async function waitForFindStatus(page, expected) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if ((await readFindStatus(page)) === expected) return true;
+    await delay(50);
+  }
+  return false;
+}
+
+async function verifyBrowserFind({ page, client, browserId, inspectorPort, artifactDir }) {
+  const failures = [];
+  const findInput = page.locator('[aria-label="Find in pane"]');
+  const guest = await readGuest(page, browserId);
+  assert(guest, "Browser guest was unavailable for find");
+
+  // Real input to the focused guest, so the main process's before-input-event owns it.
+  const modifier = process.platform === "darwin" ? "meta" : "control";
+  await evaluateInMain(
+    inspectorPort,
+    `(() => {
+      const guest = process.mainModule.require('electron').webContents.fromId(${guest.webContentsId});
+      guest.sendInputEvent({ type: 'keyDown', keyCode: 'F', modifiers: ['${modifier}'] });
+      guest.sendInputEvent({ type: 'keyUp', keyCode: 'F', modifiers: ['${modifier}'] });
+    })()`,
+  );
+  try {
+    await findInput.waitFor({ state: "visible", timeout: 5_000 });
+  } catch {
+    failures.push("Command+F in the focused page did not open browser find");
+    return failures;
+  }
+  if (!(await findInput.evaluate((input) => input === document.activeElement))) {
+    failures.push("browser find opened without focusing its query field");
+  }
+
+  // The target page shows "Bridge target" and "Typing target".
+  await page.keyboard.type("target");
+  if (!(await waitForFindStatus(page, "1 of 2"))) {
+    failures.push(
+      `browser find counted ${await readFindStatus(page)} for "target", expected 1 of 2`,
+    );
+  }
+  await page.keyboard.press("Enter");
+  if (!(await waitForFindStatus(page, "2 of 2"))) {
+    failures.push(`Enter in browser find reached ${await readFindStatus(page)}, expected 2 of 2`);
+  }
+  await page.keyboard.press("Shift+Enter");
+  if (!(await waitForFindStatus(page, "1 of 2"))) {
+    failures.push(
+      `Shift+Enter in browser find reached ${await readFindStatus(page)}, expected 1 of 2`,
+    );
+  }
+  await page.screenshot({ path: path.join(artifactDir, "browser-find.png") });
+
+  await page.keyboard.press("Escape");
+  try {
+    await findInput.waitFor({ state: "hidden", timeout: 5_000 });
+  } catch {
+    failures.push("Escape did not close browser find");
+  }
+  const selection = await callBrowserTool(client, "browser_evaluate", {
+    browserId,
+    function: "() => String(globalThis.getSelection())",
+  });
+  if (JSON.parse(selection.resultJson) !== "") {
+    failures.push(`closing browser find left a page selection: ${selection.resultJson}`);
+  }
+
+  // The host renderer handles the shortcut while the browser chrome has focus.
+  await page.locator('[aria-label="Browser URL"]').click();
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+F" : "Control+F");
+  try {
+    await findInput.waitFor({ state: "visible", timeout: 5_000 });
+    if ((await findInput.inputValue()) !== "target") {
+      failures.push("reopening browser find dropped the previous query");
+    }
+  } catch {
+    failures.push("Command+F in the browser URL bar did not open browser find");
+  }
+  await page.keyboard.press("Escape");
+  await findInput.waitFor({ state: "hidden", timeout: 5_000 }).catch(() => undefined);
+  return failures;
 }
 
 async function verifyHiddenBrowserScreenshots({
@@ -679,6 +769,15 @@ async function runRegression({
     browserId,
   );
   assert(focusedGuest === true, "Electron did not focus the registered browser guest");
+
+  failures.push(
+    ...(await verifyBrowserFind({ page, client, browserId, inspectorPort, artifactDir })),
+  );
+  await clickGuestElement(page, client, browserId, "#typing-target");
+  assert(
+    await waitForGuestActiveElement(client, browserId, "typing-target"),
+    "Physical browser click did not refocus the guest input after find",
+  );
 
   const deviceSizeMenuPainted = await selectDeviceSize(page, "iPhone SE · 375×667");
   assert(deviceSizeMenuPainted, "Device size menu did not paint above the browser surface");
