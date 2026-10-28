@@ -1,6 +1,6 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile, unlink } from "node:fs/promises";
 import { app, session, net } from "electron";
 
 const REACT_DEVTOOLS_EXTENSION_ID = "fmkadmapgofadopljbjfkapdkoienihi";
@@ -63,31 +63,47 @@ async function patchReactDevToolsForElectron(extensionPath: string): Promise<voi
   console.log(`[DevTools] Patched React DevTools ${manifest.version} content scripts for Electron`);
 }
 
+async function downloadReactDevTools(extensionPath: string): Promise<void> {
+  const crxUrl = `https://clients2.google.com/service/update2/crx?response=redirect&acceptformat=crx2,crx3&x=id%3D${REACT_DEVTOOLS_EXTENSION_ID}%26uc&prodversion=${process.versions.chrome}`;
+  const crxPath = `${extensionPath}.crx`;
+
+  const buffer = await new Promise<Buffer>((resolve, reject) => {
+    const request = net.request(crxUrl);
+    request.on("response", (response) => {
+      if (response.statusCode !== 200) {
+        reject(new Error(`Download returned HTTP ${response.statusCode}`));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve(Buffer.concat(chunks)));
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+    request.end();
+  });
+
+  await writeFile(crxPath, buffer);
+  const unzipCrx = (await import("unzip-crx-3")).default;
+  await unzipCrx(crxPath, extensionPath);
+  await unlink(crxPath);
+}
+
 export async function loadReactDevTools(): Promise<void> {
   const extensionsDir = path.join(app.getPath("userData"), "extensions");
   const extensionPath = path.join(extensionsDir, REACT_DEVTOOLS_EXTENSION_ID);
 
   if (!existsSync(extensionPath)) {
     await mkdir(extensionsDir, { recursive: true });
-    const crxUrl = `https://clients2.google.com/service/update2/crx?response=redirect&acceptformat=crx2,crx3&x=id%3D${REACT_DEVTOOLS_EXTENSION_ID}%26uc&prodversion=${process.versions.chrome}`;
-    const crxPath = `${extensionPath}.crx`;
-
-    const buffer = await new Promise<Buffer>((resolve, reject) => {
-      const request = net.request(crxUrl);
-      request.on("response", (response) => {
-        const chunks: Buffer[] = [];
-        response.on("data", (chunk) => chunks.push(chunk));
-        response.on("end", () => resolve(Buffer.concat(chunks)));
-        response.on("error", reject);
-      });
-      request.on("error", reject);
-      request.end();
-    });
-
-    await writeFile(crxPath, buffer);
-    const unzipCrx = (await import("unzip-crx-3")).default;
-    await unzipCrx(crxPath, extensionPath);
-    await unlink(crxPath);
+    try {
+      await downloadReactDevTools(extensionPath);
+    } catch (err) {
+      // Offline or blocked networks must not stop the dev app from opening.
+      console.warn("[DevTools] Failed to download React DevTools:", err);
+      await rm(extensionPath, { recursive: true, force: true });
+      await rm(`${extensionPath}.crx`, { force: true });
+      return;
+    }
   }
 
   try {
